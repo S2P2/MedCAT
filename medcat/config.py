@@ -369,6 +369,8 @@ class Preprocessing(MixingConfig, BaseModel):
     """If None the default set of stowords from spacy will be used. This must be a Set."""
     max_document_length: int = 1000000
     """Documents longer  than this will be trimmed"""
+    tokenize_engine: str = "newmm"
+    """The tokenize engine. The default is newmm. You can read more: https://pythainlp.github.io/docs/4.0/api/tokenize.html#pythainlp.tokenize.word_tokenize"""
 
     class Config:
         extra = Extra.allow

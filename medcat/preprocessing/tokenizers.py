@@ -5,6 +5,7 @@ from typing import Any, List, Dict, cast, Iterable, Union, Pattern
 from spacy.tokenizer import Tokenizer
 from spacy.language import Language
 from spacy.tokens import Doc
+from spacy.vocab import Vocab
 from tokenizers import ByteLevelBPETokenizer
 from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
 from medcat.config import Config
@@ -53,9 +54,19 @@ def spacy_split_all(nlp: Language, config: Config) -> Tokenizer:
             infix_finditer=infix_re.finditer
             )
     
-def thai_tokenizer_factory(nlp: Language, config: Config) -> Tokenizer:
-        return ThaiTokenizer(nlp.vocab)
+class ExtendedThaiTokenizer(ThaiTokenizer):
+    def __init__(self, vocab: Vocab, engine: str) -> None:
+        super().__init__(vocab: Vocab)
+        self.engine = engine
 
+    def __call__(self, text: str) -> Doc:
+        words = list(self.word_tokenize(text, engine=self.engine))
+        spaces = [False] * len(words)
+        return Doc(self.vocab, words=words, spaces=spaces)
+    
+def thai_tokenizer_factory(nlp: Language, config: Config) -> Tokenizer:
+    
+    return ExtendedThaiTokenizer(nlp.vocab, engine = config.preprocessing.tokenize_engine)
 
 class WordpieceTokenizer(object):
     """Runs WordPiece tokenziation."""
