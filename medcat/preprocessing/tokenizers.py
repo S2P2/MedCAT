@@ -56,7 +56,7 @@ def spacy_split_all(nlp: Language, config: Config) -> Tokenizer:
     
 class ExtendedThaiTokenizer(ThaiTokenizer):
     def __init__(self, vocab: Vocab, engine: str) -> None:
-        super().__init__(vocab: Vocab)
+        super().__init__(vocab)
         self.engine = engine
 
     def __call__(self, text: str) -> Doc:
