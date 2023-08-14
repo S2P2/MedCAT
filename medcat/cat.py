@@ -112,7 +112,8 @@ class CAT(object):
 
         if self.vocab is not None:
             spell_checker = BasicSpellChecker(cdb_vocab=self.cdb.vocab, config=config, data_vocab=self.vocab)
-            self.pipe.add_token_normalizer(spell_checker=spell_checker, config=config)
+            # self.pipe.add_token_normalizer(spell_checker=spell_checker, config=config)
+            # disable norm for now
 
             # Add NER
             self.ner = NER(self.cdb, config)

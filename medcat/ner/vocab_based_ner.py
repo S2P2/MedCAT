@@ -38,7 +38,9 @@ class NER(PipeRunner):
             tkn = _doc[i]
             tkns = [tkn]
             #name_versions = [tkn.lower_, tkn._.norm]
-            name_versions = [tkn._.norm, tkn.lower_]
+            # name_versions = [tkn._.norm, tkn.lower_]
+            # disable norm for now
+            name_versions = [tkn.lower_]
             name = ""
 
             for name_version in name_versions:
@@ -58,7 +60,9 @@ class NER(PipeRunner):
                         break
                     tkn = _doc[j]
                     tkns.append(tkn)
-                    name_versions = [tkn._.norm, tkn.lower_]
+                    # name_versions = [tkn._.norm, tkn.lower_]
+                    # disable norm fo now
+                    name_versions = [tkn.lower_]
 
                     name_changed = False
                     name_reverse = None

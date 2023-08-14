@@ -36,13 +36,17 @@ def prepare_name(raw_name: str, nlp: Language, names: Dict, config: Config) -> D
             tokens = []
             for t in sc_name:
                 if not t._.to_skip:
-                    if len(t.lower_) < config.preprocessing['min_len_normalize']:
-                        tokens.append(t.lower_)
-                    elif (config.preprocessing.get('do_not_normalize', set())) and t.tag_ is not None and \
-                            t.tag_ in (config.preprocessing.get('do_not_normalize', set())):
-                        tokens.append(t.lower_)
-                    else:
-                        tokens.append(t.lemma_.lower())
+                    # if len(t.lower_) < config.preprocessing['min_len_normalize']:
+                    #     tokens.append(t.lower_)
+                    # elif (config.preprocessing.get('do_not_normalize', set())) and t.tag_ is not None and \
+                    #         t.tag_ in (config.preprocessing.get('do_not_normalize', set())):
+                    #     tokens.append(t.lower_)
+                    # else:
+                    #     tokens.append(t.lemma_.lower())
+                        
+                    #spaCy-pyThaiNLP has no lemma_ so use all lower_ for now
+                    tokens.append(t.lower_)
+                    
 
         if tokens is not None and tokens:
             snames = set()

@@ -40,16 +40,32 @@ class Pipe(object):
     """
 
     def __init__(self, tokenizer: Tokenizer, config: Config) -> None:
-        #self._nlp = spacy.blank('th')
-        #self._nlp.add_pipe('pythainlp')
-        #self._nlp = Thai()
-        #self._nlp.add_pipe('pythainlp')
-        self._nlp = spacy.load(config.general.spacy_model, disable=config.general.spacy_disabled_components)
-        if config.preprocessing.stopwords is not None:
-            self._nlp.Defaults.stop_words = set(config.preprocessing.stopwords)
-        self._nlp.tokenizer = tokenizer(self._nlp, config)
+        self._nlp = spacy.blank('th')
+        self._nlp.add_pipe(
+            "pythainlp", 
+            config={
+                "pos_engine": "perceptron",
+                "pos": True,
+                "pos_corpus": "orchid_ud",
+                "sent_engine": "crfcut",
+                "sent": True,
+                "ner_engine": "thainer",
+                "ner": False,
+                "tokenize_engine": "newmm",
+                "tokenize": False,
+                "dependency_parsing": False,
+                "dependency_parsing_engine": "esupar",
+                "dependency_parsing_model": None,
+                "word_vector": False,
+                "word_vector_model": "thai2fit_wv"
+            }
+        )
+        # self._nlp = spacy.load(config.general.spacy_model, disable=config.general.spacy_disabled_components)
+        # if config.preprocessing.stopwords is not None:
+        #     self._nlp.Defaults.stop_words = set(config.preprocessing.stopwords)
+        # self._nlp.tokenizer = tokenizer(self._nlp, config)
         # Set max document length
-        self._nlp.max_length = config.preprocessing.max_document_length
+        # self._nlp.max_length = config.preprocessing.max_document_length
         self.config = config
         # Set log level
         logger.setLevel(self.config.general.log_level)
