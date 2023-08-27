@@ -206,10 +206,10 @@ class ThaiEngTokenNormalizer(PipeRunner):
     name = 'th_en_token_normalizer'
 
     # Override
-    def __init__(self, config, spell_checker=None):
+    def __init__(self, config, spell_checker=None, th_spell_checker=None):
         self.config = config
         self.spell_checker = spell_checker
-        self.th_spell_checker = ThaiBasicSpellChecker
+        self.th_spell_checker = th_spell_checker
         self.nlp = spacy.load(config.general.spacy_model, disable=config.general.spacy_disabled_components)
         super().__init__(self.config.general.workers)
 
