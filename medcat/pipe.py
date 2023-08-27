@@ -12,7 +12,7 @@ from tqdm.autonotebook import tqdm
 from medcat.linking.context_based_linker import Linker
 from medcat.meta_cat import MetaCAT
 from medcat.ner.vocab_based_ner import NER
-from medcat.utils.normalizers import TokenNormalizer, BasicSpellChecker
+from medcat.utils.normalizers import ThaiEngTokenNormalizer, BasicSpellChecker
 from medcat.config import Config
 from medcat.pipeline.pipe_runner import PipeRunner
 from medcat.preprocessing.taggers import tag_skip_punct_lang
@@ -73,7 +73,7 @@ class Pipe(object):
             Token.set_extension(field, default=False, force=True)
 
     def add_token_normalizer(self, config: Config, name: Optional[str] = None, spell_checker: Optional[BasicSpellChecker] = None) -> None:
-        token_normalizer = TokenNormalizer(config=config, spell_checker=spell_checker)
+        token_normalizer = ThaiEngTokenNormalizer(config=config, spell_checker=spell_checker)
         component_name = spacy.util.get_object_name(token_normalizer)
         name = name if name is not None else component_name
         Language.component(name=component_name, func=token_normalizer)
