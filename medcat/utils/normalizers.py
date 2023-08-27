@@ -232,7 +232,7 @@ class ThaiEngTokenNormalizer(PipeRunner):
                 if len(token.text) >= self.config.general.spell_check_len_limit and not token._.is_punct \
                         and token.lower_ not in self.spell_checker and not CONTAINS_NUMBER.search(token.lower_):
                     if token._.lang == 'th':
-                        fix = self.th_spell_checker.fix(token.lower_)
+                        fix = self.th_spell_checker.fix(token.text)
                     else:
                         fix = self.spell_checker.fix(token.lower_)
                     if fix is not None:
