@@ -4,7 +4,8 @@ from pathlib import Path
 from gensim.models import Word2Vec
 from medcat.vocab import Vocab
 from medcat.pipe import Pipe
-from medcat.preprocessing.tokenizers import spacy_split_all
+# from medcat.preprocessing.tokenizers import spacy_split_all
+from medcat.preprocessing.tokenizers import thai_tokenizer_factory
 from medcat.preprocessing.iterators import SimpleIter
 from medcat.preprocessing.taggers import tag_skip_punct_lang
 
@@ -44,7 +45,7 @@ class MakeVocab(object):
             self.vocab = Vocab()
 
         # Build the required spacy pipeline
-        self.pipe = Pipe(tokenizer=spacy_split_all, config=config)
+        self.pipe = Pipe(tokenizer=thai_tokenizer_factory, config=config)
         self.pipe.add_tagger(tagger=tag_skip_punct_lang,
                              name='skip_punct_lang',
                              additional_fields=['is_punct', 'lang'])
