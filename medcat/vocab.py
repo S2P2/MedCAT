@@ -208,24 +208,47 @@ class Vocab(object):
             table_size (int):
                 The size of the table (Defaults to 100 000 000)
         """
-        freqs = []
-        unigram_table = []
+        # # Original method
+        # freqs = []
+        # unigram_table = []
 
+        # words = list(self.vec_index2word.values())
+        # for word in words:
+        #     freqs.append(self[word])
+
+        # freqs = np.array(freqs)
+        # freqs = np.power(freqs, 3/4)
+        # sm = np.sum(freqs)
+
+        # for ind in self.vec_index2word.keys():
+        #     word = self.vec_index2word[ind]
+        #     f_ind = words.index(word)
+        #     p = freqs[f_ind] / sm
+        #     unigram_table.extend([ind] * int(p * table_size))
+
+        # self.unigram_table = np.array(unigram_table)
+    
+        # Optimized method to make unigram table for negative sampling."""
         words = list(self.vec_index2word.values())
-        for word in words:
-            freqs.append(self[word])
-
-        freqs = np.array(freqs)
+        indices = list(self.vec_index2word.keys())
+        freqs = np.array([self[word] for word in words], dtype=np.float32)
+        
+        # Apply the exponent and normalize
         freqs = np.power(freqs, 3/4)
-        sm = np.sum(freqs)
-
-        for ind in self.vec_index2word.keys():
-            word = self.vec_index2word[ind]
-            f_ind = words.index(word)
-            p = freqs[f_ind] / sm
-            unigram_table.extend([ind] * int(p * table_size))
-
-        self.unigram_table = np.array(unigram_table)
+        total_freq = np.sum(freqs)
+        probs = freqs / total_freq
+        
+        # Compute the number of appearances in the unigram table
+        counts = np.floor(probs * table_size).astype(np.int32)
+        
+        # Efficiently create the unigram table
+        unigram_table = np.zeros(np.sum(counts), dtype=np.int32)
+        position = 0
+        for ind, count in zip(indices, counts):
+            unigram_table[position:position + count] = ind
+            position += count
+        
+        self.unigram_table = unigram_table
 
     def get_negative_samples(self, n: int = 6, ignore_punct_and_num: bool = False) -> List[int]:
         """Get N negative samples.
