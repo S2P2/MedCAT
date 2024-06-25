@@ -231,7 +231,7 @@ class Vocab(object):
         # Optimized method to make unigram table for negative sampling."""
         words = list(self.vec_index2word.values())
         indices = list(self.vec_index2word.keys())
-        freqs = np.array([self[word] for word in words], dtype=np.float32)
+        freqs = np.array([self[word] for word in words])
         
         # Apply the exponent and normalize
         freqs = np.power(freqs, 3/4)
