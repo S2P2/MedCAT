@@ -1,6 +1,10 @@
 import numpy as np
 import pickle
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, cast
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class Vocab(object):
@@ -22,18 +26,18 @@ class Vocab(object):
         self.vocab: Dict = {}
         self.index2word: Dict = {}
         self.vec_index2word: Dict = {}
-        self.unigram_table: np.ndarray = np.array([])
+        self.cum_probs = np.array([])
 
-    def inc_or_add(self, word: str, cnt: int = 1, vec: Optional[np.ndarray] = None):
-        """Add a word or incrase its count.
+    def inc_or_add(self, word: str, cnt: int = 1, vec: Optional[np.ndarray] = None) -> None:
+        """Add a word or increase its count.
 
         Args:
             word(str):
                 Word to be added
-            cnt(int, optional):
+            cnt(int):
                 By how much should the count be increased, or to what
                 should it be set if a new word. (Default value = 1)
-            vec(Optional[np.ndarray], optional):
+            vec(Optional[np.ndarray]):
                 Word vector (Default value = None)
         """
         if word not in self.vocab:
@@ -70,14 +74,14 @@ class Vocab(object):
             if self.vocab[word]['vec'] is not None:
                 self.vec_index2word[ind] = word
 
-    def inc_wc(self, word: str, cnt: int = 1):
+    def inc_wc(self, word: str, cnt: int = 1) -> None:
         """Incraese word count by cnt.
 
         Args:
             word(str):
                 For which word to increase the count
-            cnt(int, optional):
-                By how muhc to incrase the count (Default value = 1)
+            cnt(int):
+                By how muhc to increase the count (Default value = 1)
         """
         self.item(word)['cnt'] += cnt
 
@@ -100,7 +104,7 @@ class Vocab(object):
         """Reset the count for all word to cnt.
 
         Args:
-            cnt(int, optional):
+            cnt(int):
                 New count for all words in the vocab. (Default value = 1)
         """
         for word in self.vocab.keys():
@@ -123,11 +127,11 @@ class Vocab(object):
         Args:
             word(str):
                 The word to be added, it should be lemmatized and lowercased
-            cnt(int, optional):
+            cnt(int):
                 Count of this word in your dataset (Default value = 1)
-            vec(Optional[np.ndarray], optional):
+            vec(Optional[np.ndarray]):
                 The vector representation of the word (Default value = None)
-            replace(bool, optional):
+            replace(bool):
                 Will replace old vector representation (Default value = True)
         """
         if word not in self.vocab:
@@ -158,7 +162,7 @@ class Vocab(object):
         Args:
             path(str):
                 path to the file with words and vectors
-            replace(bool, optional):
+            replace(bool):
                 existing words in the vocabulary will be replaced (Default value = True)
         """
         with open(path) as f:
@@ -172,50 +176,48 @@ class Vocab(object):
 
                 self.add_word(word, cnt, vec, replace)
 
-    def make_unigram_table(self, table_size: int = 100000000) -> None:
+    def make_unigram_table(self, table_size: int = -1) -> None:
         """Make unigram table for negative sampling, look at the paper if interested
         in details.
 
         Args:
-            table_size(int, optional):
-                The size of the table (Defaults to 100 000 000)
+            table_size (int):
+                The size of the table - no longer needed (Defaults to -1)
         """
+        if table_size != -1:
+            logger.warning("Unigram table size is no longer necessary since "
+                           "there is now a simpler approach that doesn't require "
+                           "the creation of a massive array. So therefore, there "
+                           "is no need to pass the `table_size` parameter anymore.")
         freqs = []
-        unigram_table = []
-
-        words = list(self.vec_index2word.values())
-        for word in words:
+        for word in self.vec_index2word.values():
             freqs.append(self[word])
 
-        freqs = np.array(freqs)
-        freqs = np.power(freqs, 3/4)
-        sm = np.sum(freqs)
+        # Power and normalize frequencies
+        freqs = np.array(freqs) ** (3/4)
+        freqs /= freqs.sum()
 
-        for ind in self.vec_index2word.keys():
-            word = self.vec_index2word[ind]
-            f_ind = words.index(word)
-            p = freqs[f_ind] / sm
-            unigram_table.extend([ind] * int(p * table_size))
-
-        self.unigram_table = np.array(unigram_table)
+        # Calculate cumulative probabilities
+        self.cum_probs = np.cumsum(freqs)
 
     def get_negative_samples(self, n: int = 6, ignore_punct_and_num: bool = False) -> List[int]:
         """Get N negative samples.
 
         Args:
-            n(int, optional):
+            n (int):
                 How many words to return (Default value = 6)
-            ignore_punct_and_num(bool, optional):
+            ignore_punct_and_num (bool):
                 Whether to ignore punctuation and numbers. (Default value = False)
 
         Returns:
             List[int]:
                 Indices for words in this vocabulary.
         """
-        if len(self.unigram_table) == 0:
-            raise Exception("No unigram table present, please run the function vocab.make_unigram_table() first.")
-        inds = np.random.randint(0, len(self.unigram_table), n)
-        inds = self.unigram_table[inds]
+        if len(self.cum_probs) == 0:
+            self.make_unigram_table()
+        random_vals = np.random.rand(n)
+        # NOTE: there's a change in numpy
+        inds = cast(List[int], np.searchsorted(self.cum_probs, random_vals).tolist())
 
         if ignore_punct_and_num:
             # Do not return anything that does not have letters in it
@@ -250,4 +252,9 @@ class Vocab(object):
         with open(path, 'rb') as f:
             vocab = cls()
             vocab.__dict__ = pickle.load(f)
+        if not hasattr(vocab, 'cum_probs'):
+            # NOTE: this is not too expensive, only around 0.05s
+            vocab.make_unigram_table()
+        if hasattr(vocab, 'unigram_table'):
+            del vocab.unigram_table
         return vocab

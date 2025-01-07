@@ -10,6 +10,7 @@ from medcat.cat import CAT
 from medcat.vocab import Vocab
 
 from medcat.utils.saving.serializer import JsonSetSerializer, CDBSerializer, SPECIALITY_NAMES, ONE2MANY
+from medcat.utils.saving.envsnapshot import ENV_SNAPSHOT_FILE_NAME
 
 import medcat.utils.saving.coding as _
 
@@ -60,6 +61,7 @@ class ModelCreationTests(unittest.TestCase):
     json_model_pack = tempfile.TemporaryDirectory()
     EXAMPLES = os.path.join(os.path.dirname(
         os.path.realpath(__file__)), "..", "..", "..", "examples")
+    EXCEPTIONAL_JSONS = ['model_card.json', ENV_SNAPSHOT_FILE_NAME]
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -87,7 +89,7 @@ class ModelCreationTests(unittest.TestCase):
         model_pack_folder = os.path.join(
             self.json_model_pack.name, model_pack_path)
         json_path = os.path.join(model_pack_folder, "*.json")
-        jsons = glob.glob(json_path)
+        jsons = [fn for fn in glob.glob(json_path) if not fn.endswith("config.json")]
         # there is also a model_card.json
         # but nothing for cui2many or name2many
         # so can remove the length of ONE2MANY
@@ -95,7 +97,7 @@ class ModelCreationTests(unittest.TestCase):
             SPECIALITY_NAMES) - len(ONE2MANY))
         for json in jsons:
             with self.subTest(f'JSON {json}'):
-                if json.endswith('model_card.json'):
+                if any(json.endswith(exception) for exception in self.EXCEPTIONAL_JSONS):
                     continue  # ignore model card here
                 if any(name in json for name in ONE2MANY):
                     # ignore cui2many and name2many
@@ -117,10 +119,6 @@ class ModelCreationTests(unittest.TestCase):
         # The spacy model has full path in the loaded model, thus won't be equal
         cat.config.general.spacy_model = os.path.basename(
             cat.config.general.spacy_model)
-        # There can also be issues with loading the config.linking.weighted_average_function from file
-        # This should be fixed with newer models,
-        # but the example model is older, so has the older functionalitys
-        cat.config.linking.weighted_average_function = self.undertest.config.linking.weighted_average_function
         self.assertEqual(cat.config.asdict(), self.undertest.config.asdict())
         self.assertEqual(cat.cdb.config, self.undertest.cdb.config)
         self.assertEqual(len(cat.vocab.vocab), len(self.undertest.vocab.vocab))
@@ -140,8 +138,7 @@ class ModelCreationTests(unittest.TestCase):
         self.assertEqual(cat.vocab.index2word, self.undertest.vocab.index2word)
         self.assertEqual(cat.vocab.vec_index2word,
                          self.undertest.vocab.vec_index2word)
-        self.assertEqual(cat.vocab.unigram_table,
-                         self.undertest.vocab.unigram_table)
+        self.assertTrue((cat.vocab.cum_probs == self.undertest.vocab.cum_probs).all())
         for name in SPECIALITY_NAMES:
             if name in ONE2MANY:
                 # ignore cui2many and name2many

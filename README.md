@@ -17,7 +17,7 @@ We have 4 public models available:
 1) UMLS Small (A modelpack containing a subset of UMLS (disorders, symptoms, medications...). Trained on MIMIC-III)
 2) SNOMED International (Full SNOMED modelpack trained on MIMIC-III)
 3) UMLS Dutch v1.10 (a modelpack provided by UMC Utrecht containing [UMLS entities with Dutch names](https://github.com/umcu/dutch-umls) trained on Dutch medical wikipedia articles and a negation detection model [repository](https://github.com/umcu/negation-detection/)/[paper](https://doi.org/10.48550/arxiv.2209.00470) trained on EMC Dutch Clinical Corpus).
-4) UMLS Full. >4MM concepts trained self-supervsied on MIMIC-III. v2022AA of UMLS.
+4) UMLS Full. >4MM concepts trained self-supervised on MIMIC-III. v2022AA of UMLS.
 
 To download any of these models, please [follow this link](https://uts.nlm.nih.gov/uts/login?service=https://medcat.rosalind.kcl.ac.uk/auth-callback) and sign into your NIH profile / UMLS license. You will then be redirected to the MedCAT model download form. Please complete this form and you will be provided a download link.
 
@@ -38,8 +38,20 @@ To download any of these models, please [follow this link](https://uts.nlm.nih.g
 - **Paper**: [What’s in a Summary? Laying the Groundwork for Advances in Hospital-Course Summarization](https://www.aclweb.org/anthology/2021.naacl-main.382.pdf)
 - ([more...](https://github.com/CogStack/MedCAT/blob/master/media/news.md))
 
+## Installation
+To install the latest version of MedCAT run the following command:
+```
+pip install medcat
+```
+Normal installations of MedCAT will install torch-gpu and all relevant dependancies (such as CUDA). This can require as much as 10 GB more disk space, which isn't required for CPU only usage.
+
+To install the latest version of MedCAT without torch GPU support run the following command:
+```
+pip install medcat --extra_index_url https://download.pytorch.org/whl/cpu/
+```
 ## Demo
 A demo application is available at [MedCAT](https://medcat.rosalind.kcl.ac.uk). This was trained on MIMIC-III and all of SNOMED-CT.
+PS: This link can take a long time to load the first time around. The machine spins up as needed and spins down when inactive.
 
 ## Tutorials
 A guide on how to use MedCAT is available at [MedCAT Tutorials](https://github.com/CogStack/MedCATtutorials). Read more about MedCAT on [Towards Data Science](https://towardsdatascience.com/medcat-introduction-analyzing-electronic-health-records-e1c420afa13a).

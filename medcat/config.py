@@ -1,23 +1,21 @@
 from datetime import datetime
-from pydantic import BaseModel, Extra, ValidationError
-from pydantic.dataclasses import Any, Callable, Dict, Optional, Union
-from pydantic.fields import ModelField
-from typing import List, Set, Tuple, cast
+from pydantic import BaseModel, ValidationError
+from typing import List, Set, Tuple, cast, Any, Callable, Dict, Optional, Union, Type, Literal
 from multiprocessing import cpu_count
 import logging
 import jsonpickle
+import json
 from functools import partial
 import re
 
 from medcat.utils.hasher import Hasher
 from medcat.utils.matutils import intersect_nonempty_set
+from medcat.utils.config_utils import attempt_fix_weighted_average_function
+from medcat.utils.config_utils import weighted_average, is_old_type_config_dict
+from medcat.utils.saving.coding import CustomDelegatingEncoder, default_hook
 
 
 logger = logging.getLogger(__name__)
-
-
-def weighted_average(step: int, factor: float) -> float:
-    return max(0.1, 1 - (step ** 2 * factor))
 
 
 def workers(workers_override: Optional[int] = None) -> int:
@@ -28,7 +26,16 @@ class FakeDict:
     """FakeDict that allows the use of the __getitem__ and __setitem__ method for legacy access."""
 
     def __getitem__(self, arg: str) -> Any:
-        return getattr(self, arg)
+        try:
+            return getattr(self, arg)
+        except AttributeError as e:
+            raise KeyError from e
+
+    def __setattr__(self, arg: str, val) -> None:
+        # TODO: remove this in the future when we stop stupporting this in config
+        if isinstance(self, Linking) and arg == "weighted_average_function":
+            val = attempt_fix_weighted_average_function(val)
+        super().__setattr__(arg, val)
 
     def __setitem__(self, arg: str, val) -> None:
         setattr(self, arg, val)
@@ -98,8 +105,8 @@ class MixingConfig(FakeDict):
             save_path(str): Where to save the created json file
         """
         # We want to save the dict here, not the whole class
-        json_string = jsonpickle.encode(
-            {field: getattr(self, field) for field in self.fields()})
+        json_string = json.dumps(self.asdict(), cls=cast(Type[json.JSONEncoder],
+                                                         CustomDelegatingEncoder.def_inst))
 
         with open(save_path, 'w') as f:
             f.write(json_string)
@@ -117,14 +124,14 @@ class MixingConfig(FakeDict):
                 attr = None # new attribute
             value = config_dict[key]
             if isinstance(value, BaseModel):
-                value = value.dict()
+                value = value.model_dump()
             if isinstance(attr, MixingConfig):
                 attr.merge_config(value)
             else:
                 try:
                     setattr(self, key, value)
                 except AttributeError as err:
-                    logger.warning('Issue with setting attribtue "%s":', key, exc_info=err)
+                    logger.warning('Issue with setting attribute "%s":', key, exc_info=err)
         self.rebuild_re()
 
     def parse_config_file(self, path: str, extractor: ValueExtractor = _DEFAULT_EXTRACTOR) -> None:
@@ -138,7 +145,10 @@ class MixingConfig(FakeDict):
 
         Args:
             path(str): the path to the config file
-            extractor(ValueExtractor, optional):  (Default value = _DEFAULT_EXTRACTOR)
+            extractor(ValueExtractor):  (Default value = _DEFAULT_EXTRACTOR)
+
+        Raises:
+            ValueError: In case of unknown attribute.
         """
         with open(path, 'r') as f:
             for line in f:
@@ -166,7 +176,7 @@ class MixingConfig(FakeDict):
     def _calc_hash(self, hasher: Optional[Hasher] = None) -> Hasher:
         if hasher is None:
             hasher = Hasher()
-        for _, v in cast(BaseModel, self).dict().items():
+        for _, v in cast(BaseModel, self).model_dump().items():
             if isinstance(v, MixingConfig):
                 v._calc_hash(hasher)
             else:
@@ -178,7 +188,7 @@ class MixingConfig(FakeDict):
         return hasher.hexdigest()
 
     def __str__(self) -> str:
-        return str(cast(BaseModel, self).dict())
+        return str(cast(BaseModel, self).model_dump())
 
     @classmethod
     def load(cls, save_path: str) -> "MixingConfig":
@@ -196,7 +206,12 @@ class MixingConfig(FakeDict):
 
         # Read the jsonpickle string
         with open(save_path) as f:
-            config_dict = jsonpickle.decode(f.read())
+            config_dict = json.load(f, object_hook=default_hook)
+        if is_old_type_config_dict(config_dict):
+            logger.warning("Loading an old type of config (jsonpickle) from '%s'",
+                            save_path)
+            with open(save_path) as f:
+                config_dict = jsonpickle.decode(f.read())
 
         config.merge_config(config_dict)
 
@@ -222,15 +237,15 @@ class MixingConfig(FakeDict):
         Returns:
             Dict[str, Any]: The dictionary associated with this config
         """
-        return cast(BaseModel, self).dict()
+        return cast(BaseModel, self).model_dump()
 
-    def fields(self) -> Dict[str, ModelField]:
+    def fields(self) -> dict:
         """Get the fields associated with this config.
 
         Returns:
-            Dict[str, Field]: The dictionary of the field names and fields
+            dict: The dictionary of the field names and fields
         """
-        return cast(BaseModel, self).__fields__
+        return cast(BaseModel, self).model_fields
 
 
 class VersionInfo(MixingConfig, BaseModel):
@@ -256,7 +271,7 @@ class VersionInfo(MixingConfig, BaseModel):
     """Which version of medcat was used to build the CDB"""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -265,7 +280,7 @@ class CDBMaker(MixingConfig, BaseModel):
     name_versions: list = ['LOWER', 'CLEAN']
     """Name versions to be generated."""
     multi_separator: str = '|'
-    """If multiple names or type_ids for a concept present in one row of a CSV, they are separted
+    """If multiple names or type_ids for a concept present in one row of a CSV, they are separated
     by the character below."""
     remove_parenthesis: int = 5
     """Should preferred names with parenthesis be cleaned 0 means no, else it means if longer than or equal
@@ -274,7 +289,7 @@ class CDBMaker(MixingConfig, BaseModel):
     """Minimum number of letters required in a name to be accepted for a concept"""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -287,7 +302,7 @@ class AnnotationOutput(MixingConfig, BaseModel):
     include_text_in_output: bool = False
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -301,8 +316,32 @@ class CheckPoint(MixingConfig, BaseModel):
     """When training the maximum checkpoints will be kept on the disk"""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
+
+
+class UsageMonitor(MixingConfig, BaseModel):
+    enabled: Literal[True, False, 'auto'] = False
+    r"""Whether usage monitoring is enabled (True), disabled (False), or automatic ('auto').
+
+    If set to False, no logging is performed.
+    If set to True, logs are saved in the location specified by `log_folder`.
+    If set to 'auto', logs will be automatically enabled or disabled based on
+    environmenta variable (`MEDCAT_LOGS` - setting it to False or 0 disabled logging)
+    and distributed according to the OS preferred logs location (`MEDCAT_LOGS_LOCATION`).
+    The defaults for the location are:
+     - For Linux: ~/.local/share/medcat/logs/
+     - For Windows: C:\Users\%USERNAME%\.cache\medcat\logs\
+    """
+    batch_size: int = 100
+    """Number of logged events to write at once."""
+    file_prefix: str = "usage_"
+    """The prefix for logged files. The suffix will be the model hash."""
+    log_folder: str = "."
+    """The folder which contains the usage logs. In certain situations,
+    it may make sense to keep this separate from the overall logs.
+
+    NOTE: Does not take affect if `enabled` is set to 'auto'"""
 
 
 class General(MixingConfig, BaseModel):
@@ -310,7 +349,11 @@ class General(MixingConfig, BaseModel):
     spacy_disabled_components: list = ['ner', 'parser', 'vectors', 'textcat',
                                        'entity_linker', 'sentencizer', 'entity_ruler', 'merge_noun_chunks',
                                        'merge_entities', 'merge_subtokens']
+    """The list of spacy components that will be disabled.
+
+    NB! For these changes to take effect, the pipe would need to be recreated."""
     checkpoint: CheckPoint = CheckPoint()
+    usage_monitor: UsageMonitor = UsageMonitor()
     """Checkpointing config"""
     log_level: int = logging.INFO
     """Logging config for everything | 'tagger' can be disabled, but will cause a drop in performance"""
@@ -343,17 +386,22 @@ class General(MixingConfig, BaseModel):
     should not be used when annotating millions of documents. If `None` it will be the string "concept", if `short` it will be CUI,
     if `long` it will be CUI | Name | Confidence"""
     map_cui_to_group: bool = False
-    """If the cdb.addl_info['cui2group'] is provided and this option enabled, each CUI will be maped to the group"""
+    """If the cdb.addl_info['cui2group'] is provided and this option enabled, each CUI will be mapped to the group"""
+    simple_hash: bool = False
+    """Whether to use a simple hash.
+
+    NOTE: While using a simple hash is faster at save time, it is less
+    reliable due to not taking into account all the details of the changes."""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
 class Preprocessing(MixingConfig, BaseModel):
     """The preprocessing part of the config"""
     words_to_skip: set = {'nos'}
-    """This words will be completly ignored from concepts and from the text (must be a Set)"""
+    """This words will be completely ignored from concepts and from the text (must be a Set)"""
     keep_punct: set = {'.', ':'}
     """All punct will be skipped by default, here you can set what will be kept"""
     do_not_normalize: set = {'VBD', 'VBG', 'VBN', 'VBP', 'JJS', 'JJR'}
@@ -362,16 +410,20 @@ class Preprocessing(MixingConfig, BaseModel):
     - https://spacy.io/usage/linguistic-features#pos-tagging
     - Label scheme section per model at https://spacy.io/models/en"""
     skip_stopwords: bool = False
-    """Should stopwords be skipped/ingored when processing input"""
+    """Should stopwords be skipped/ignored when processing input"""
     min_len_normalize: int = 5
     """Nothing below this length will ever be normalized (input tokens or concept names), normalized means lemmatized in this case"""
     stopwords: Optional[set] = None
-    """If None the default set of stowords from spacy will be used. This must be a Set."""
+    """If None the default set of stowords from spacy will be used. This must be a Set.
+
+    NB! For these changes to take effect, the pipe would need to be recreated."""
     max_document_length: int = 1000000
-    """Documents longer  than this will be trimmed"""
+    """Documents longer  than this will be trimmed.
+
+    NB! For these changes to take effect, the pipe would need to be recreated."""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -380,7 +432,7 @@ class Ner(MixingConfig, BaseModel):
     min_name_len: int = 3
     """Do not detect names below this limit, skip them"""
     max_skip_tokens: int = 2
-    """When checkng tokens for concepts you can have skipped tokens inbetween
+    """When checking tokens for concepts you can have skipped tokens between
     used ones (usually spaces, new lines etc). This number tells you how many skipped can you have."""
     check_upper_case_names: bool = False
     """Check uppercase to distinguish uppercase and lowercase words that have a different meaning."""
@@ -391,7 +443,7 @@ class Ner(MixingConfig, BaseModel):
     """Try reverse word order for short concepts (2 words max), e.g. heart disease -> disease heart"""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -414,13 +466,13 @@ _DEFAULT_PARTIAL = _DefPartial()
 class LinkingFilters(MixingConfig, BaseModel):
     """These describe the linking filters used alongside the model.
 
-    When no CUIs nor exlcuded CUIs are specified (the sets are empty),
+    When no CUIs nor excluded CUIs are specified (the sets are empty),
     all CUIs are accepted.
     If there are CUIs specified then only those will be accepted.
     If there are excluded CUIs specified, they are excluded.
 
     In some cases, there are extra filters as well as MedCATtrainer (MCT) export filters.
-    These are expcted to follow the following:
+    These are expected to follow the following:
     extra_cui_filter ⊆ MCT filter ⊆ Model/config filter
 
     While any other CUIs can be included in the the extra CUI filter or the MCT filter,
@@ -428,6 +480,19 @@ class LinkingFilters(MixingConfig, BaseModel):
     """
     cuis: Set[str] = set()
     cuis_exclude: Set[str] = set()
+
+    def __init__(self, **data):
+        if 'cuis' in data:
+            cuis = data['cuis']
+            if isinstance(cuis, dict) and len(cuis) == 0:
+                logger.warning("Loading an old model where "
+                               "config.linking.filters.cuis has been "
+                               "dict to an empty dict instead of an empty "
+                               "set. Converting the dict to a set in memory "
+                               "as that is what is expected. Please consider "
+                               "saving the model again.")
+                data['cuis'] = set(cuis.keys())
+        super().__init__(**data)
 
     def check_filters(self, cui: str) -> bool:
         """Checks is a CUI in the filters
@@ -489,13 +554,10 @@ class Linking(MixingConfig, BaseModel):
     """Concepts that have seen less training examples than this will not be used for
     similarity calculation and will have a similarity of -1."""
     always_calculate_similarity: bool = False
-    """Do we want to calculate context similarity even for concepts that are not ambigous."""
-    weighted_average_function: Callable[..., Any] = _DEFAULT_PARTIAL
-    """Weights for a weighted average
-    'weighted_average_function': partial(weighted_average, factor=0.02),"""
+    """Do we want to calculate context similarity even for concepts that are not ambiguous."""
     calculate_dynamic_threshold: bool = False
     """Concepts below this similarity will be ignored. Type can be static/dynamic - if dynamic each CUI has a different TH
-    and it is calcualted as the average confidence for that CUI * similarity_threshold. Take care that dynamic works only
+    and it is calculated as the average confidence for that CUI * similarity_threshold. Take care that dynamic works only
     if the cdb was trained with calculate_dynamic_threshold = True."""
     similarity_threshold_type: str = 'static'
     similarity_threshold: float = 0.25
@@ -506,17 +568,17 @@ class Linking(MixingConfig, BaseModel):
     prefer_primary_name: float = 0.35
     """If >0 concepts for which a detection is its primary name will be preferred by that amount (0 to 1)"""
     prefer_frequent_concepts: float = 0.35
-    """If >0 concepts that are more frequent will be prefered by a multiply of this amount"""
+    """If >0 concepts that are more frequent will be preferred by a multiply of this amount"""
     subsample_after: int = 30000
     """DISABLED in code permanetly: Subsample during unsupervised training if a concept has received more than"""
     devalue_linked_concepts: bool = False
     """When adding a positive example, should it also be treated as Negative for concepts
-    which link to the postive one via names (ambigous names)."""
+    which link to the positive one via names (ambiguous names)."""
     context_ignore_center_tokens: bool = False
-    """If true when the context of a concept is calculated (embedding) the words making that concept are not taken into accout"""
+    """If true when the context of a concept is calculated (embedding) the words making that concept are not taken into account"""
 
     class Config:
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
 
@@ -531,12 +593,13 @@ class Config(MixingConfig, BaseModel):
     linking: Linking = Linking()
     word_skipper: re.Pattern = re.compile('') # empty pattern gets replaced upon init
     punct_checker: re.Pattern = re.compile('') # empty pattern gets replaced upon init
+    hash: Optional[str] = None
 
     class Config:
         # this if for word_skipper and punct_checker which would otherwise
         # not have a validator
         arbitrary_types_allowed = True
-        extra = Extra.allow
+        extra = 'allow'
         validate_assignment = True
 
     def __init__(self, *args, **kwargs):
@@ -548,13 +611,16 @@ class Config(MixingConfig, BaseModel):
         # Some regex that we will need
         self.word_skipper = re.compile('^({})$'.format(
             '|'.join(self.preprocessing.words_to_skip)))
-        # Very agressive punct checker, input will be lowercased
+        # Very aggressive punct checker, input will be lowercased
         self.punct_checker = re.compile(r'[^a-z0-9]+')
 
     # Override
     def get_hash(self):
         hasher = Hasher()
-        for k, v in self.dict().items():
+        for k, v in self.model_dump().items():
+            if k in ['hash', ]:
+                # ignore hash
+                continue
             if k not in ['version', 'general', 'linking']:
                 hasher.update(v, length=True)
             elif k == 'general':
@@ -570,5 +636,43 @@ class Config(MixingConfig, BaseModel):
                         hasher.update(v2, length=False)
                     else:
                         hasher.update(v2, length=True)
+        self.hash = hasher.hexdigest()
+        return self.hash
 
-        return hasher.hexdigest()
+
+class UseOfOldConfigOptionException(AttributeError):
+
+    def __init__(self, conf_type: Type[FakeDict], arg_name: str, advice: str) -> None:
+        super().__init__(f"Tried to use {conf_type.__name__}.{arg_name}. "
+                         f"Advice: {advice}")
+        self.conf_type = conf_type
+        self.arg_name = arg_name
+        self.advice = advice
+
+
+# NOTE: The following is for backwards compatibility and should be removed
+#       at some point in the future
+
+# wrapper for functions for a better error in case of weighted_average_function
+# access
+def _wrapper(func, check_type: Type[FakeDict], advice: str, exp_type: Type[Exception]):
+    def wrapper(*args, **kwargs):
+        try:
+            res = func(*args, **kwargs)
+        except exp_type as ex:
+            if ((len(args) == 2 and len(kwargs) == 0) and
+                    (isinstance(args[0], check_type) and
+                    args[1] == "weighted_average_function")):
+                raise UseOfOldConfigOptionException(Linking, args[1], advice) from ex
+            raise ex
+        return res
+    return wrapper
+
+
+# wrap Linking.__getattribute__ so that when getting weighted_average_function
+# we get a nicer exceptio
+_waf_advice = "You can use `cat.cdb.weighted_average_function` to access it directly"
+Linking.__getattribute__ = _wrapper(Linking.__getattribute__, Linking, _waf_advice, AttributeError)  # type: ignore
+if hasattr(Linking, '__getattr__'):
+    Linking.__getattr__ = _wrapper(Linking.__getattr__, Linking, _waf_advice, AttributeError)  # type: ignore
+Linking.__getitem__ = _wrapper(Linking.__getitem__, Linking, _waf_advice, KeyError)  # type: ignore
