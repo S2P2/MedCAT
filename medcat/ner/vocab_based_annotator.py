@@ -19,14 +19,17 @@ def maybe_annotate_name(name: str, tkns: List[Token], doc: Doc, cdb: CDB, config
             The name found in the text of the document.
         tkns (List[spacy.tokens.Token]):
             Tokens that belong to this name in the spacy document.
-        doc (spacy.tokens.Doc):
+        doc (Doc):
             Spacy document to be annotated with named entities.
-        cdb (medcat.cdb.CDB):
+        cdb (CDB):
             Concept database.
-        config (medcat.config.Config):
+        config (Config):
             Global config for medcat.
         label (str):
             Label for this name (usually `concept` if we are using a vocab based approach).
+
+    Returns:
+        Optional[Span]: The Span, if relevant.
     """
 
     logger.debug("Maybe annotating name: %s", name)
@@ -121,7 +124,7 @@ class (object):
                         if self.cdb.name2cui2status[name][cui] == 'P':
                             # Means this name should be used for training as it nearly always links to
                             #the concept with this CUI
-                            return cui # Break the loop, one name marked with 'P' linkes to max 1 concept
+                            return cui # Break the loop, one name marked with 'P' links to max 1 concept
             return None
 
         else:
@@ -166,7 +169,7 @@ class (object):
                         cui = list(self.cdb.name2cui[name])[0]
                         self._cat._add_ann(cui, doc, tkns, acc=1, name=name)
                     elif self._cat.train and name in self.pref_names and len(name) > 3:
-                        # If training use prefered names as ground truth
+                        # If training use preferred names as ground truth
                         cuis = self.cdb.name2cui[name]
                         for cui in cuis:
                             if name == self.cdb.cui2pref_name.get(cui, 'nan-nan'):

@@ -5,24 +5,23 @@ import torch
 import numpy
 from multiprocessing import Lock
 from torch import nn, Tensor
-from spacy.tokens import Doc
+from spacy.tokens import Doc, Span
 from datetime import datetime
 from typing import Iterable, Iterator, Optional, Dict, List, Tuple, cast, Union
 from medcat.utils.hasher import Hasher
 from medcat.config_meta_cat import ConfigMetaCAT
 from medcat.utils.meta_cat.ml_utils import predict, train_model, set_all_seeds, eval_model
-from medcat.utils.meta_cat.data_utils import prepare_from_json, encode_category_values
+from medcat.utils.meta_cat.data_utils import prepare_from_json, encode_category_values, prepare_for_oversampled_data
 from medcat.pipeline.pipe_runner import PipeRunner
 from medcat.tokenizers.meta_cat_tokenizers import TokenizerWrapperBase
 from medcat.utils.meta_cat.data_utils import Doc as FakeDoc
-from medcat.utils.decorators import deprecated
+from peft import get_peft_model, LoraConfig, TaskType
 
 # It should be safe to do this always, as all other multiprocessing
 # will be finished before data comes to meta_cat
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
-
-logger = logging.getLogger(__name__) # separate logger from the package-level one
+logger = logging.getLogger(__name__)  # separate logger from the package-level one
 
 
 class MetaCAT(PipeRunner):
@@ -76,6 +75,9 @@ class MetaCAT(PipeRunner):
             embeddings (Optional[Tensor]):
                 The embedding densor
 
+        Raises:
+            ValueError: If the meta model is not LSTM or BERT
+
         Returns:
             nn.Module:
                 The module
@@ -83,24 +85,43 @@ class MetaCAT(PipeRunner):
         config = self.config
         if config.model['model_name'] == 'lstm':
             from medcat.utils.meta_cat.models import LSTM
-            model = LSTM(embeddings, config)
+            model: nn.Module = LSTM(embeddings, config)
+            logger.info("LSTM model used for classification")
+
+        elif config.model['model_name'] == 'bert':
+            from medcat.utils.meta_cat.models import BertForMetaAnnotation
+            model = BertForMetaAnnotation(config)
+
+            if not config.model.model_freeze_layers:
+                peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, inference_mode=False, r=8, lora_alpha=16,
+                                         target_modules=["query", "value"], lora_dropout=0.2)
+
+                model = get_peft_model(model, peft_config)
+                # model.print_trainable_parameters()
+
+            logger.info("BERT model used for classification")
+
         else:
             raise ValueError("Unknown model name %s" % config.model['model_name'])
 
         return model
 
-    def get_hash(self):
-        """A partial hash trying to catch differences between models."""
+    def get_hash(self) -> str:
+        """A partial hash trying to catch differences between models.
+
+        Returns:
+            str: The hex hash.
+        """
         hasher = Hasher()
         # Set last_train_on if None
-        if self.config.train['last_train_on'] is None:
-            self.config.train['last_train_on'] = datetime.now().timestamp()
+        if self.config.train.last_train_on is None:
+            self.config.train.last_train_on = datetime.now().timestamp()
 
         hasher.update(self.config.get_hash())
         return hasher.hexdigest()
 
-    @deprecated(message="Use `train_from_json` or `train_raw` instead")
-    def train(self, json_path: Union[str, list], save_dir_path: Optional[str] = None) -> Dict:
+    def train_from_json(self, json_path: Union[str, list], save_dir_path: Optional[str] = None,
+                        data_oversampled: Optional[list] = None) -> Dict:
         """Train or continue training a model give a json_path containing a MedCATtrainer export. It will
         continue training if an existing model is loaded or start new training if the model is blank/new.
 
@@ -110,19 +131,12 @@ class MetaCAT(PipeRunner):
             save_dir_path (Optional[str]):
                 In case we have aut_save_model (meaning during the training the best model will be saved)
                 we need to set a save path. Defaults to `None`.
-        """
-        return self.train_from_json(json_path, save_dir_path)
+            data_oversampled (Optional[list]):
+                In case of oversampling being performed, the data will be passed in the parameter allowing the
+                model to be trained on original + synthetic data.
 
-    def train_from_json(self, json_path: Union[str, list], save_dir_path: Optional[str] = None) -> Dict:
-        """Train or continue training a model give a json_path containing a MedCATtrainer export. It will
-        continue training if an existing model is loaded or start new training if the model is blank/new.
-
-        Args:
-            json_path (Union[str, list]):
-                Path/Paths to a MedCATtrainer export containing the meta_annotations we want to train for.
-            save_dir_path (Optional[str]):
-                In case we have aut_save_model (meaning during the training the best model will be saved)
-                we need to set a save path. Defaults to `None`.
+        Returns:
+            Dict: The resulting report.
         """
 
         # Load the medcattrainer export
@@ -144,27 +158,49 @@ class MetaCAT(PipeRunner):
         for path in json_path:
             with open(path, 'r') as f:
                 data_loaded = merge_data_loaded(data_loaded, json.load(f))
-        return self.train_raw(data_loaded, save_dir_path)
+        return self.train_raw(data_loaded, save_dir_path, data_oversampled=data_oversampled)
 
-    def train_raw(self, data_loaded: Dict, save_dir_path: Optional[str] = None) -> Dict:
-        """Train or continue training a model given raw data. It will
-        continue training if an existing model is loaded or start new training if the model is blank/new.
+    def train_raw(self, data_loaded: Dict, save_dir_path: Optional[str] = None, data_oversampled: Optional[list] = None) -> Dict:
+        """
+        Train or continue training a model given raw data. It will continue training if an existing model is loaded or start new training if the model is blank/new.
 
         The raw data is expected in the following format:
-        {'projects':
-            [ # list of projects
-                { # project 1
-                    'name': '<some name>',
-                    # list of documents
-                    'documents': [{'name': '<some name>',  # document 1
-                                    'text': '<text of the document>',
-                                    # list of annotations
-                                    'annotations': [{'start': -1,  # annotation 1
-                                                    'end': 1,
-                                                    'cui': 'cui',
-                                                    'value': '<text value>'}, ...],
-                                    }, ...]
-                }, ...
+
+        {
+
+            'projects': [  # list of projects
+
+                {
+
+                    'name': '<project_name>',
+
+                    'documents': [  # list of documents
+
+                        {
+
+                            'name': '<document_name>',
+
+                            'text': '<text_of_document>',
+
+                            'annotations': [  # list of annotations
+
+                                {
+
+                                    'start': -1,  # start index of the annotation
+
+                                    'end': 1,    # end index of the annotation
+
+                                    'cui': 'cui',
+
+                                    'value': '<annotation_value>'
+                                },
+                                ...
+                            ],
+                        },
+                        ...
+                    ]
+                },
+                ...
             ]
         }
 
@@ -174,6 +210,20 @@ class MetaCAT(PipeRunner):
             save_dir_path (Optional[str]):
                 In case we have aut_save_model (meaning during the training the best model will be saved)
                 we need to set a save path. Defaults to `None`.
+            data_oversampled (Optional[list]):
+                In case of oversampling being performed, the data will be passed in the parameter allowing the
+                model to be trained on original + synthetic data.
+                The format of which is expected: [[['text','of','the','document'], [index of medical entity], "label" ],
+                ['text','of','the','document'], [index of medical entity], "label" ]]
+
+        Returns:
+            Dict: The resulting report.
+
+        Raises:
+            Exception: If no save path is specified, or category name not in data.
+            AssertionError: If no tokeniser is set
+            FileNotFoundError: If phase_number is set to 2 and model.dat file is not found
+            KeyError: If phase_number is set to 2 and model.dat file contains mismatched architecture
         """
         g_config = self.config.general
         t_config = self.config.train
@@ -192,7 +242,7 @@ class MetaCAT(PipeRunner):
                                  replace_center=g_config['replace_center'], prerequisites=t_config['prerequisites'],
                                  lowercase=g_config['lowercase'])
 
-        # Check is the name there
+        # Check is the name present
         category_name = g_config['category_name']
         if category_name not in data:
             raise Exception(
@@ -200,24 +250,51 @@ class MetaCAT(PipeRunner):
                     category_name, " | ".join(list(data.keys()))))
 
         data = data[category_name]
+        if data_oversampled:
+            data_sampled = prepare_for_oversampled_data(data_oversampled, self.tokenizer)
+            data = data + data_sampled
 
         category_value2id = g_config['category_value2id']
         if not category_value2id:
             # Encode the category values
-            data, category_value2id = encode_category_values(data)
+            full_data, data_undersampled, category_value2id = encode_category_values(data,
+                                                                                     category_undersample=self.config.model.category_undersample)
             g_config['category_value2id'] = category_value2id
         else:
             # We already have everything, just get the data
-            data, _ = encode_category_values(data, existing_category_value2id=category_value2id)
-
+            full_data, data_undersampled, category_value2id = encode_category_values(data,
+                                                                                     existing_category_value2id=category_value2id,
+                                                                                     category_undersample=self.config.model.category_undersample)
+            g_config['category_value2id'] = category_value2id
         # Make sure the config number of classes is the same as the one found in the data
         if len(category_value2id) != self.config.model['nclasses']:
             logger.warning(
-                "The number of classes set in the config is not the same as the one found in the data: {} vs {}".format(
-                    self.config.model['nclasses'], len(category_value2id)))
+                "The number of classes set in the config is not the same as the one found in the data: %d vs %d",self.config.model['nclasses'], len(category_value2id))
             logger.warning("Auto-setting the nclasses value in config and rebuilding the model.")
             self.config.model['nclasses'] = len(category_value2id)
-            self.model = self.get_model(embeddings=self.embeddings)
+
+        if self.config.model.phase_number == 2 and save_dir_path is not None:
+            model_save_path = os.path.join(save_dir_path, 'model.dat')
+            device = torch.device(g_config['device'])
+            try:
+                self.model.load_state_dict(torch.load(model_save_path, map_location=device))
+                logger.info("Model state loaded from dict for 2 phase learning")
+
+            except FileNotFoundError:
+                raise FileNotFoundError(f"\nError: Model file not found at path: {model_save_path}\nPlease run phase 1 training and then run phase 2.")
+
+            except KeyError:
+                raise KeyError("\nError: Missing key in loaded state dictionary. \nThis might be due to a mismatch between the model architecture and the saved state.")
+
+            except Exception as e:
+                raise Exception(f"\nError: Model state cannot be loaded from dict. {e}")
+
+        data = full_data
+        if self.config.model.phase_number == 1:
+            data = data_undersampled
+            if not t_config['auto_save_model']:
+                logger.info("For phase 1, model state has to be saved. Saving model...")
+                t_config['auto_save_model'] = True
 
         report = train_model(self.model, data=data, config=self.config, save_dir_path=save_dir_path)
 
@@ -233,7 +310,7 @@ class MetaCAT(PipeRunner):
                 # Save everything now
                 self.save(save_dir_path=save_dir_path)
 
-        self.config.train['last_train_on'] = datetime.now().timestamp()
+        self.config.train.last_train_on = datetime.now().timestamp()
         return report
 
     def eval(self, json_path: str) -> Dict:
@@ -248,10 +325,8 @@ class MetaCAT(PipeRunner):
                 The resulting model dict
 
         Raises:
-            AssertionError:
-                If self.tokenizer
-            Exception:
-                If the category name does not exist
+            AssertionError: If self.tokenizer
+            Exception: If the category name does not exist
         """
         g_config = self.config.general
         t_config = self.config.train
@@ -275,7 +350,7 @@ class MetaCAT(PipeRunner):
 
         # We already have everything, just get the data
         category_value2id = g_config['category_value2id']
-        data, _ = encode_category_values(data, existing_category_value2id=category_value2id)
+        data, _, _ = encode_category_values(data, existing_category_value2id=category_value2id)
 
         # Run evaluation
         assert self.tokenizer is not None
@@ -291,8 +366,7 @@ class MetaCAT(PipeRunner):
                 Path to the directory where everything will be saved.
 
         Raises:
-            AssertionError:
-                If self.tokenizer is None
+            AssertionError: If self.tokenizer is None
         """
         # Create dirs if they do not exist
         os.makedirs(save_dir_path, exist_ok=True)
@@ -300,8 +374,8 @@ class MetaCAT(PipeRunner):
         # Save tokenizer
         assert self.tokenizer is not None
         self.tokenizer.save(save_dir_path)
-
         # Save config
+
         self.config.save(os.path.join(save_dir_path, 'config.json'))
 
         # Save the model
@@ -330,7 +404,7 @@ class MetaCAT(PipeRunner):
         # Load config
         config = cast(ConfigMetaCAT, ConfigMetaCAT.load(os.path.join(save_dir_path, 'config.json')))
 
-        # Overwrite loaded paramters with something new
+        # Overwrite loaded parameters with something new
         if config_dict is not None:
             config.merge_config(config_dict)
 
@@ -341,7 +415,7 @@ class MetaCAT(PipeRunner):
             tokenizer = TokenizerWrapperBPE.load(save_dir_path)
         elif config.general['tokenizer_name'] == 'bert-tokenizer':
             from medcat.tokenizers.meta_cat_tokenizers import TokenizerWrapperBERT
-            tokenizer = TokenizerWrapperBERT.load(save_dir_path)
+            tokenizer = TokenizerWrapperBERT.load(save_dir_path, config.model['model_variant'])
 
         # Create meta_cat
         meta_cat = cls(tokenizer=tokenizer, embeddings=None, config=config)
@@ -357,6 +431,21 @@ class MetaCAT(PipeRunner):
 
         return meta_cat
 
+    def get_ents(self, doc: Doc) -> Iterable[Span]:
+        spangroup_name = self.config.general.span_group
+        if spangroup_name:
+            try:
+                return doc.spans[spangroup_name]
+            except KeyError:
+                raise Exception(
+                    f"Configuration error MetaCAT was configured to set meta_anns on {spangroup_name} but this spangroup was not set on the doc.")
+
+        # Should we annotate overlapping entities
+        if self.config.general['annotate_overlapping']:
+            return doc._.ents
+
+        return doc.ents
+
     def prepare_document(self, doc: Doc, input_ids: List, offset_mapping: List, lowercase: bool) -> Tuple:
         """Prepares document.
 
@@ -366,7 +455,7 @@ class MetaCAT(PipeRunner):
             input_ids (List):
                 Input ids
             offset_mapping (List):
-                Offset mapings
+                Offset mappings
             lowercase (bool):
                 Whether to use lower case replace center
 
@@ -381,31 +470,35 @@ class MetaCAT(PipeRunner):
         cntx_right = config.general['cntx_right']
         replace_center = config.general['replace_center']
 
-        # Should we annotate overlapping entities
-        if config.general['annotate_overlapping']:
-            ents = doc._.ents
-        else:
-            ents = doc.ents
+        ents = self.get_ents(doc)
 
         samples = []
         last_ind = 0
-        ent_id2ind = {}  # Map form entitiy ID to where is it in the samples array
+        ent_id2ind = {}  # Map form entity ID to where is it in the samples array
         for ent in sorted(ents, key=lambda ent: ent.start_char):
             start = ent.start_char
             end = ent.end_char
 
-            ind = 0
-            # Start where the last ent was found, cannot be before it as we've sorted
+            # Updated implementation to extract all the tokens for the medical entity (rather than the one)
+            ctoken_idx = []
             for ind, pair in enumerate(offset_mapping[last_ind:]):
-                if start >= pair[0] and start < pair[1]:
-                    break
-            ind = last_ind + ind # If we did not start from 0 in the for loop
-            last_ind = ind
+                # Checking if we've reached at the start of the entity
+                if start <= pair[0] or start <= pair[1]:
+                    if end <= pair[1]:
+                        ctoken_idx.append(ind) # End reached
+                        break
+                    else:
+                        ctoken_idx.append(ind) # Keep going
 
-            _start = max(0, ind - cntx_left)
-            _end = min(len(input_ids), ind + 1 + cntx_right)
+            # Start where the last ent was found, cannot be before it as we've sorted
+            last_ind += ind  # If we did not start from 0 in the for loop
+
+            _start = max(0, ctoken_idx[0] - cntx_left)
+            _end = min(len(input_ids), ctoken_idx[-1] + 1 + cntx_right)
+
             tkns = input_ids[_start:_end]
             cpos = cntx_left + min(0, ind - cntx_left)
+            cpos_new = [x - _start for x in ctoken_idx]
 
             if replace_center is not None:
                 if lowercase:
@@ -420,8 +513,7 @@ class MetaCAT(PipeRunner):
                 ln = e_ind - s_ind  # Length of the concept in tokens
                 assert self.tokenizer is not None
                 tkns = tkns[:cpos] + self.tokenizer(replace_center)['input_ids'] + tkns[cpos + ln + 1:]
-
-            samples.append([tkns, cpos])
+            samples.append([tkns, cpos_new])
             ent_id2ind[ent._.id] = len(samples) - 1
 
         return ent_id2ind, samples
@@ -436,9 +528,8 @@ class MetaCAT(PipeRunner):
             batch_size_chars (int):
                 Number of characters per batch
 
-        Returns:
-            Generator[List[Dic]]:
-                The document generator
+        Yields:
+            List[Doc]: The batch of documents.
         """
         docs = []
         char_count = 0
@@ -465,13 +556,16 @@ class MetaCAT(PipeRunner):
             *args: Unused arguments (due to override)
             **kwargs: Unused keyword arguments (due to override)
 
+        Yields:
+            Doc: The document.
+
         Returns:
-            Generator[Doc]:
-                The document generator
+            Iterator[Doc]: stream is None or empty.
         """
         # Just in case
         if stream is None or not stream:
-            return stream
+            # return an empty generator
+            return
 
         config = self.config
         id2category_value = {v: k for k, v in config.general['category_value2id'].items()}
@@ -515,17 +609,13 @@ class MetaCAT(PipeRunner):
                     for i, doc in enumerate(docs):
                         data.extend(doc._.share_tokens[0])
                         doc_ind2positions[i] = doc._.share_tokens[1]
-
                 all_predictions, all_confidences = predict(self.model, data, config)
                 for i, doc in enumerate(docs):
                     start_ind, end_ind, ent_id2ind = doc_ind2positions[i]
 
                     predictions = all_predictions[start_ind:end_ind]
                     confidences = all_confidences[start_ind:end_ind]
-                    if config.general['annotate_overlapping']:
-                        ents = doc._.ents
-                    else:
-                        ents = doc.ents
+                    ents = self.get_ents(doc)
 
                     for ent in ents:
                         ent_ind = ent_id2ind[ent._.id]
@@ -550,8 +640,11 @@ class MetaCAT(PipeRunner):
         document processing.
 
         Args:
-            doc (spacy.tokens.Doc):
+            doc (Doc):
                 A spacy document
+
+        Returns:
+            Doc: The same spacy document.
         """
 
         # Just call the pipe method
@@ -559,19 +652,17 @@ class MetaCAT(PipeRunner):
 
         return doc
 
-    def get_model_card(self, as_dict: bool = False):
+    def get_model_card(self, as_dict: bool = False) -> Union[str, dict]:
         """A minimal model card.
 
         Args:
-            as_dict (bool, optional):
-                return the model card as a dictionary instead of a str. (Default value = False)
+            as_dict (bool):
+                Return the model card as a dictionary instead of a str. (Default value = False)
 
         Returns:
-            str:
+            Union[str, dict]:
                 An indented JSON object.
-            OR
-            Dict:
-                A JSON object in dict form
+                OR A JSON object in dict form.
         """
         card = {
             'Category Name': self.config.general['category_name'],

@@ -1,4 +1,4 @@
-"""This modlue is responsible for the (new) methods of saving and loading parts of MedCAT.
+"""This module is responsible for the (new) methods of saving and loading parts of MedCAT.
 
 The idea is to move away from saving medcat files using the dill/pickle.
 And to save as well as load them in some other way.
@@ -36,7 +36,7 @@ class JsonSetSerializer:
         if not os.path.exists(folder):
             os.makedirs(folder)
         elif not os.path.isdir(folder):
-            raise ValueError(f'Folder expected, got fille: {folder}')
+            raise ValueError(f'Folder expected, got file: {folder}')
         if os.path.isdir(self.file_name):
             raise ValueError(
                 f'Expected file, found folder: {self.file_name}')
@@ -111,13 +111,13 @@ class CDBSerializer:
         If `json_path` was specified to the constructor, this will serialize
         some of the parts that take up more memory in JSON files in said directory.
         In that case, the rest of the info is saved into the `main_path` passed to
-        the consturctor
+        the constructor
         Otherwise, everything is saved to the `main_path` using `dill.dump`
         just like in previous cases.
 
         Args:
             cdb (CDB): The context database (CDB)
-            overwrite (bool, optional): Whether to allow overwriting existing files. Defaults to False.
+            overwrite (bool): Whether to allow overwriting existing files. Defaults to False.
 
         Raises:
             ValueError: If file(s) exist(s) and overwrite if `False`
@@ -135,13 +135,12 @@ class CDBSerializer:
             raise ValueError(f'Unable to overwrite shelf path "{self.json_path}"'
                              ' - specify overrwrite=True if you wish to overwrite')
         to_save = {}
-        to_save['config'] = cdb.config.asdict()
         # This uses different names so as to not be ambiguous
         # when looking at files whether the json parts should
         # exist separately or not
         to_save['cdb_main' if self.jsons is not None else 'cdb'] = dict(
             ((key, val) for key, val in cdb.__dict__.items() if
-             key != 'config' and
+             key not in ('config', '_config_from_file') and
              (self.jsons is None or key not in SPECIALITY_NAMES)))
         logger.info('Dumping CDB to %s', self.main_path)
         with open(self.main_path, 'wb') as f:
@@ -159,13 +158,26 @@ class CDBSerializer:
         the JSON serialized files are used.
         Otherwise, everything is loaded from the `main_path` file.
 
+        Args:
+            cdb_cls: CDB class.
+
         Returns:
             CDB: The resulting CDB.
         """
         logger.info('Reading CDB data from %s', self.main_path)
         with open(self.main_path, 'rb') as f:
             data = dill.load(f)
-        config = cast(Config, Config.from_dict(data['config']))
+        if 'config' in data:
+            logger.warning("Found config in CDB for model (%s). "
+                           "This is an old format. Please re-save the "
+                           "model in the new format to avoid potential issues",
+                           os.path.dirname(self.main_path))
+            config = cast(Config, Config.from_dict(data['config']))
+        else:
+            # by passing None as config to constructor
+            # the CDB should identify that there has been
+            # no config loaded
+            config = None
         cdb = cdb_cls(config=config)
         if self.jsons is None:
             cdb_main = data['cdb']

@@ -5,15 +5,19 @@ import json
 import logging
 import aiofiles
 import numpy as np
-from typing import Dict, Set, Optional, List, Union
-from functools import partial
+from typing import Dict, Set, Optional, List, Union, cast, Iterable
+import os
 
 from medcat import __version__
 from medcat.utils.hasher import Hasher
 from medcat.utils.matutils import unitvec
 from medcat.utils.ml_utils import get_lr_linking
-from medcat.config import Config, weighted_average, workers
+from medcat.config import Config, workers
 from medcat.utils.saving.serializer import CDBSerializer
+from medcat.utils.config_utils import get_and_del_weighted_average_from_config
+from medcat.utils.config_utils import default_weighted_average
+from medcat.utils.config_utils import ensure_backward_compatibility
+from medcat.utils.config_utils import fix_waf_lambda, attempt_fix_weighted_average_function
 
 
 logger = logging.getLogger(__name__)
@@ -24,7 +28,7 @@ class CDB(object):
 
     Properties:
         name2cuis (Dict[str, List[str]]):
-            Map fro concept name to CUIs - one name can map to multiple CUIs.
+            Map for concept name to CUIs - one name can map to multiple CUIs.
         name2cuis2status (Dict[str, Dict[str, str]]):
             What is the status for a given name and cui pair - each name can be:
                 P - Preferred, A - Automatic (e.g. let medcat decide), N - Not common.
@@ -53,7 +57,7 @@ class CDB(object):
             Any additional maps that are not part of the core CDB. These are usually not needed
             for the base NER+L use-case, but can be useufl for Debugging or some special stuff.
         vocab (Dict[str, int]):
-            Stores all the words tha appear in this CDB and the count for each one.
+            Stores all the words that appear in this CDB and the count for each one.
         is_dirty (bool):
             Whether or not the CDB has been changed since it was loaded or created
     """
@@ -61,8 +65,10 @@ class CDB(object):
     def __init__(self, config: Union[Config, None] = None) -> None:
         if config is None:
             self.config = Config()
+            self._config_from_file = False
         else:
             self.config = config
+            self._config_from_file = True
         self.name2cuis: Dict = {}
         self.name2cuis2status: Dict = {}
 
@@ -94,15 +100,38 @@ class CDB(object):
         self.vocab: Dict = {} # Vocabulary of all words ever in our cdb
         self._optim_params = None
         self.is_dirty = False
+        self._init_waf_from_config()
         self._hash: Optional[str] = None
+        # the config hash is kept track of here so that
+        # the CDB hash can be re-calculated when the config changes
+        # it can also be used to make sure the config loaded with
+        # a CDB matches the config it was saved with
+        # since the config is now saved separately
+        self._config_hash: Optional[str] = None
         self._memory_optimised_parts: Set[str] = set()
+
+    def _init_waf_from_config(self):
+        waf = get_and_del_weighted_average_from_config(self.config)
+        if waf is not None:
+            logger.info("Using (potentially) custom value of weighed "
+                        "average function")
+            self.weighted_average_function = attempt_fix_weighted_average_function(waf)
+        elif hasattr(self, 'weighted_average_function'):
+            # keep existing
+            pass
+        else:
+            self.weighted_average_function = default_weighted_average
 
     def get_name(self, cui: str) -> str:
         """Returns preferred name if it exists, otherwise it will return
         the longest name assigned to the concept.
 
         Args:
-            cui
+            cui (str):
+                Concept ID or unique identifier in this database.
+
+        Returns:
+            str: The name of the concept.
         """
         name = cui # In case we do not find anything it will just return the CUI
 
@@ -118,7 +147,7 @@ class CDB(object):
                                             (self.cui2count_train.get(cui, 0) + 1)
         self.is_dirty = True
 
-    def remove_names(self, cui: str, names: Dict) -> None:
+    def _remove_names(self, cui: str, names: Iterable[str]) -> None:
         """Remove names from an existing concept - effect is this name will never again be used to link to this concept.
         This will only remove the name from the linker (namely name2cuis and name2cuis2status), the name will still be present everywhere else.
         Why? Because it is bothersome to remove it from everywhere, but
@@ -126,11 +155,11 @@ class CDB(object):
 
         Args:
             cui (str):
-                Concept ID or unique identifer in this database.
-            names (Dict[str, Dict]):
-                Names to be removed, should look like: `{'name': {'tokens': tokens, 'snames': snames, 'raw_name': raw_name}, ...}`
+                Concept ID or unique identifier in this database.
+            names (Iterable[str]):
+                Names to be removed (e.g list, set, or even a dict (in which case keys will be used)).
         """
-        for name in names.keys():
+        for name in names:
             if name in self.name2cuis:
                 if cui in self.name2cuis[name]:
                     self.name2cuis[name].remove(cui)
@@ -156,8 +185,10 @@ class CDB(object):
 
     def remove_cui(self, cui: str) -> None:
         """This function takes a `CUI` as an argument and removes it from all the internal objects that reference it.
+
         Args:
-            cui
+            cui (str):
+                Concept ID or unique identifier in this database.
         """
         if cui in self.cui2names:
             del self.cui2names[cui]
@@ -191,19 +222,19 @@ class CDB(object):
         self.name2count_train = {name: len(cuis) for name, cuis in self.name2cuis.items()}
         self.is_dirty = True
 
-    def add_names(self, cui: str, names: Dict, name_status: str = 'A', full_build: bool = False) -> None:
+    def add_names(self, cui: str, names: Dict[str, Dict], name_status: str = 'A', full_build: bool = False) -> None:
         """Adds a name to an existing concept.
 
         Args:
             cui (str):
-                Concept ID or unique identifer in this database, all concepts that have
+                Concept ID or unique identifier in this database, all concepts that have
                 the same CUI will be merged internally.
             names (Dict[str, Dict]):
                 Names for this concept, or the value that if found in free text can be linked to this concept.
                 Names is an dict like: `{name: {'tokens': tokens, 'snames': snames, 'raw_name': raw_name}, ...}`
             name_status (str):
-                One of `P`, `N`, `A`
-            full_build (bool)):
+                One of `P`, `N`, `A`.
+            full_build (bool):
                 If True the dictionary self.addl_info will also be populated, contains a lot of extra information
                 about concepts, but can be very memory consuming. This is not necessary
                 for normal functioning of MedCAT (Default value `False`).
@@ -213,12 +244,12 @@ class CDB(object):
             # Name status must be one of the three
             name_status = 'A'
 
-        self.add_concept(cui=cui, names=names, ontologies=set(), name_status=name_status, type_ids=set(), description='', full_build=full_build)
+        self._add_concept(cui=cui, names=names, ontologies=set(), name_status=name_status, type_ids=set(), description='', full_build=full_build)
 
-    def add_concept(self,
+    def _add_concept(self,
                     cui: str,
-                    names: Dict,
-                    ontologies: set,
+                    names: Dict[str, Dict],
+                    ontologies: Set[str],
                     name_status: str,
                     type_ids: Set[str],
                     description: str,
@@ -232,7 +263,8 @@ class CDB(object):
                 the same CUI will be merged internally.
             names (Dict[str, Dict]):
                 Names for this concept, or the value that if found in free text can be linked to this concept.
-                Names is an dict like: `{name: {'tokens': tokens, 'snames': snames, 'raw_name': raw_name}, ...}`
+                Names is a dict like: `{name: {'tokens': tokens, 'snames': snames, 'raw_name': raw_name}, ...}`
+                Names should be generated by helper function 'medcat.preprocessing.cleaners.prepare_name'
             ontologies (Set[str]):
                 ontologies in which the concept exists (e.g. SNOMEDCT, HPO)
             name_status (str):
@@ -245,6 +277,9 @@ class CDB(object):
                 If True the dictionary self.addl_info will also be populated, contains a lot of extra information
                 about concepts, but can be very memory consuming. This is not necessary
                 for normal functioning of MedCAT (Default Value `False`).
+
+        Raises:
+            ValueError: If there is no name info yet `names` dict is not empty.
         """
         # Add CUI to the required dictionaries
         if cui not in self.cui2names:
@@ -277,7 +312,7 @@ class CDB(object):
             self.name_isupper[name] = names[name]['is_upper']
 
             if name in self.name2cuis:
-                # Means we have alrady seen this name
+                # Means we have already seen this name
                 if cui not in self.name2cuis[name]:
                     # If CUI is not already linked do it
                     self.name2cuis[name].append(cui)
@@ -309,6 +344,21 @@ class CDB(object):
             if name_status == 'P' and cui not in self.cui2preferred_name:
                 # Do not overwrite old preferred names
                 self.cui2preferred_name[cui] = name_info['raw_name']
+        elif names:
+            # if no name_info and names is NOT an empty dict
+            # this shouldn't really happen in the current setup
+            raise ValueError("Unknown state where there is no name_info, "
+                             "yet the `names` dict is not empty (%s)", names)
+        elif name_status == 'P' and cui not in self.cui2preferred_name:
+            # this means names is an empty `names` dict
+            logger.warning("Did not manage to add a preferred name in `add_cui`. "
+                           "Was trying to do so for cui: '%s'"
+                           "This means that the `names` dict passed was empty. "
+                           "This is _usually_ caused by either no name or too short "
+                           "a name passed to the `prepare_name` method. "
+                           "The minimum length is defined in: "
+                           "'config.cdb_maker.min_letters_required' and "
+                           "is currently set at %s", cui, self.config.cdb_maker['min_letters_required'])
 
         # Add other fields if full_build
         if full_build:
@@ -342,7 +392,7 @@ class CDB(object):
         Args:
             name (str):
                 What key should be used in the `addl_info` dictionary.
-            data (Dict[<whatever>]):
+            data (Dict):
                 What will be added as the value for the key `name`
             reset_existing (bool):
                 Should old data be removed if it exists
@@ -361,18 +411,19 @@ class CDB(object):
                               cui_count: int = 0) -> None:
         """Add the vector representation of a context for this CUI.
 
-        cui (str):
-            The concept in question.
-        vectors (Dict[str, numpy.ndarray]):
-            Vector represenation of the context, must have the format: {'context_type': np.array(<vector>), ...}
-            context_type - is usually one of: ['long', 'medium', 'short']
-        negative (bool):
-            Is this negative context of positive (Default Value `False`).
-        lr (int):
-            If set it will override the base value from the config file.
-        cui_count (int):
-            The learning rate will be calculated based on the count for the provided CUI + cui_count.
-            Defaults to 0.
+        Args:
+            cui (str):
+                The concept in question.
+            vectors (Dict[str, np.ndarray]):
+                Vector representation of the context, must have the format: {'context_type': np.array(<vector>), ...}
+                context_type - is usually one of: ['long', 'medium', 'short']
+            negative (bool):
+                Is this negative context of positive (Default Value `False`).
+            lr (Optional[float]):
+                If set it will override the base value from the config file.
+            cui_count (int):
+                The learning rate will be calculated based on the count for the provided CUI + cui_count.
+                Defaults to 0.
         """
         if cui not in self.cui2context_vectors:
             self.cui2context_vectors[cui] = {}
@@ -458,6 +509,49 @@ class CDB(object):
             }
             await f.write(dill.dumps(to_save))
 
+    def load_config(self, config_path: str, config_dict: Optional[Dict] = None) -> None:
+        """Load the config from disk.
+
+        Args:
+            config_path (str): The path to the config file.
+            config_dict (Optional[Dict]): A config to merge with.
+
+        Raises:
+            ValueError: If a config was not found in CDB nor as a separate json.
+                Or if a config was found both in CDB as well as a separate json.
+        """
+        if not os.path.exists(config_path):
+            if not self._config_from_file:
+                # if there's no config defined anywhere
+                raise ValueError("Could not find a config in the CDB nor "
+                                 "in the config.json for this model "
+                                 f"({os.path.dirname(config_path)})",
+                                 )
+            # if there is a config, but it's defined in the cdb.dat file
+            logger.warning("Could not find config.json in model pack folder "
+                           f"({os.path.dirname(config_path)}). "
+                           "This is probably an older model. Please save the model "
+                           "again in the new format to avoid potential issues.")
+        else:
+            if self._config_from_file:
+                # if there's a config.json and one defined in the cbd.dat file
+                raise ValueError("Found a config in the CDB and in the config.json "
+                                 f"for model ({os.path.dirname(config_path)}) - "
+                                 "this is ambiguous. Please either remove the "
+                                 "config.json or load the CDB without the config.json "
+                                 "in the folder and re-save in the newer format "
+                                 "(the default save in this version)")
+            # if the only config is in the separate config.json file
+            # this should be the behaviour for all newer models
+            self.config = cast(Config, Config.load(config_path))
+            logger.debug("Loaded config from CDB from %s", config_path)
+            # new config, potentially new weighted_average_function to read
+            self._init_waf_from_config()
+        # mark config read from file
+        if config_dict:
+            self.config.merge_config(config_dict)
+        self._config_from_file = True
+
     @classmethod
     def load(cls, path: str, json_path: Optional[str] = None, config_dict: Optional[Dict] = None) -> "CDB":
         """Load and return a CDB. This allows partial loads in probably not the right way at all.
@@ -472,11 +566,15 @@ class CDB(object):
                 Path to the JSON serialized folder
             config_dict:
                 A dictionary that will be used to overwrite existing fields in the config of this CDB
+
+        Returns:
+            CDB: The resulting concept database.
         """
         ser = CDBSerializer(path, json_path)
         cdb = ser.deserialize(CDB)
         cls._check_medcat_version(cdb.config.asdict())
-        cls._ensure_backward_compatibility(cdb.config)
+        fix_waf_lambda(cdb)
+        ensure_backward_compatibility(cdb.config, workers)
 
         # Overwrite the config with new data
         if config_dict is not None:
@@ -489,7 +587,7 @@ class CDB(object):
         IMPORTANT it will not import name maps (cui2names, name2cuis or anything else) only vectors.
 
         Args:
-            cdb (medcat.cdb.CDB):
+            cdb (CDB):
                 Concept database from which to import training vectors
             overwrite (bool):
                 If True all training data in the existing CDB will be overwritten, else
@@ -497,7 +595,7 @@ class CDB(object):
 
         Examples:
 
-            >>> new_cdb.import_traininig(cdb=old_cdb, owerwrite=True)
+            >>> new_cdb.import_traininig(cdb=old_cdb, overwrite=True)
         """
         # Import vectors and counts
         for cui in cdb.cui2context_vectors:
@@ -548,7 +646,7 @@ class CDB(object):
         cui2names into cui2snames.
 
         Args:
-            force (bool, optional): Whether to force the (re-)population. Defaults to True.
+            force (bool): Whether to force the (re-)population. Defaults to True.
         """
         if not force and self.cui2snames:
             return
@@ -571,8 +669,11 @@ class CDB(object):
         However, the memory optimisation can be performed again afterwards.
 
         Args:
-            cuis_to_keep (List[str]):
+            cuis_to_keep (Union[List[str], Set[str]]):
                 CUIs that will be kept, the rest will be removed (not completely, look above).
+
+        Raises:
+            Exception: If no snames and subsetting is not possible.
         """
 
         if not self.cui2snames:
@@ -663,7 +764,7 @@ class CDB(object):
                      min_cnt: int = 0,
                      topn: int = 50,
                      force_build: bool = False) -> Dict:
-        """Given a concept it will calculate what other concepts in this CDB have the most similar
+        r"""Given a concept it will calculate what other concepts in this CDB have the most similar
         embedding.
 
         Args:
@@ -683,10 +784,9 @@ class CDB(object):
                 Do not use cached sim matrix (Default value False)
 
         Returns:
-            results (Dict):
-                A dictionary with topn results like: {<cui>: {'name': <name>, 'sim': <similarity>, 'type_name': <type_name>,
+            Dict:
+                A dictionary with top results like: {<cui>: {'name': <name>, 'sim': <similarity>, 'type_name': <type_name>,
                                                               'type_id': <type_id>, 'cnt': <number of training examples the concept has seen>}, ...}
-
         """
 
         if 'similarity' in self.addl_info:
@@ -718,15 +818,17 @@ class CDB(object):
             sim_data['sim_vectors_cuis'] = np.array(sim_vectors_cuis)
 
         # Select appropriate concepts
-        type_id_inds = np.arange(0, len(sim_data['sim_vectors_type_ids']))
+        type_id_inds = np.arange(0, len(sim_data['sim_vectors_type_ids']), dtype=np.int32)
         if len(type_id_filter) > 0:
-            type_id_inds = np.array([], dtype=np.int32)
+            # NOTE: change in numpy 2
+            type_id_inds = np.array([], dtype=np.int32)  # type: ignore
             for type_id in type_id_filter:
                 type_id_inds = np.union1d(np.array([ind for ind, type_ids in enumerate(sim_data['sim_vectors_type_ids']) if type_id in type_ids]),
                         type_id_inds)
         cnt_inds = np.arange(0, len(sim_data['sim_vectors_counts']))
         if min_cnt > 0:
-            cnt_inds = np.where(sim_data['sim_vectors_counts'] >= min_cnt)[0]
+            # NOTE: change in numpy 2
+            cnt_inds = np.where(sim_data['sim_vectors_counts'] >= min_cnt)[0]  # type: ignore
         # Intersect cnt and type_id
         inds = np.intersect1d(type_id_inds, cnt_inds)
 
@@ -747,19 +849,6 @@ class CDB(object):
 
         return res
 
-    @staticmethod
-    def _ensure_backward_compatibility(config: Config) -> None:
-        # Hacky way of supporting old CDBs
-        weighted_average_function = config.linking.weighted_average_function
-        if callable(weighted_average_function) and getattr(weighted_average_function, "__name__", None) == "<lambda>":
-            # the following type ignoring is for mypy because it is unable to detect the signature
-            config.linking.weighted_average_function = partial(weighted_average, factor=0.0004) # type: ignore
-        if config.general.workers is None:
-            config.general.workers = workers()
-        disabled_comps = config.general.spacy_disabled_components
-        if 'tagger' in disabled_comps and 'lemmatizer' not in disabled_comps:
-            config.general.spacy_disabled_components.append('lemmatizer')
-
     @classmethod
     def _check_medcat_version(cls, config_data: Dict) -> None:
         cdb_medcat_version = config_data.get('version', {}).get('medcat_version', None)
@@ -777,8 +866,34 @@ which may or may not work. If you experience any compatibility issues, please re
 or download the compatible model."""
             )
 
+    def _should_recalc_hash(self, force_recalc: bool) -> bool:
+        if force_recalc:
+            return True
+        if self.config.hash is None:
+            # TODO - perhaps this is not the best?
+            # as this is a side effect
+            # get and save result in config
+            self.config.get_hash()
+        if not self._hash or self.is_dirty:
+            # if no hash saved or is dirty
+            # need to calculate
+            logger.debug("Recalculating hash due to %s",
+                         "no hash saved" if not self._hash else "CDB is dirty")
+            return True
+        # recalc config hash in case it changed
+        self.config.get_hash()
+        if self._config_hash is None or self._config_hash != self.config.hash:
+            # if no config hash saved
+            # or if the config hash is different from one saved in here
+            logger.debug("Recalculating hash due to %s",
+                         "no config hash saved" if not self._config_hash
+                         else "config hash has changed")
+            return True
+        return False
+
     def get_hash(self, force_recalc: bool = False):
-        if not force_recalc and self._hash and not self.is_dirty:
+        should_recalc = self._should_recalc_hash(force_recalc)
+        if not should_recalc:
             logger.info("Reusing old hash of CDB since the CDB has not changed: %s", self._hash)
             return self._hash
         self.is_dirty = False
@@ -791,13 +906,16 @@ or download the compatible model."""
         for k,v in self.__dict__.items():
             if k in ['cui2countext_vectors', 'name2cuis']:
                 hasher.update(v, length=False)
-            elif k in ['_hash', 'is_dirty']:
+            elif k in ['_hash', 'is_dirty', '_config_hash']:
                 # ignore _hash since if it previously didn't exist, the
                 # new hash would be different when the value does exist
                 # and ignore is_dirty so that we get the same hash as previously
                 continue
             elif k != 'config':
                 hasher.update(v, length=True)
+
+        # set cached config hash
+        self._config_hash = self.config.hash
 
         self._hash = hasher.hexdigest()
         logger.info("Found new CDB hash: %s", self._hash)

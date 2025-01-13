@@ -1,10 +1,13 @@
 import os
 import json
 import logging
+import datasets
 from spacy.tokens import Doc
 from datetime import datetime
-from typing import Iterable, Iterator, Optional, Dict, List, cast, Union
+from typing import Iterable, Iterator, Optional, Dict, List, cast, Union, Tuple, Callable, Type
 from spacy.tokens import Span
+import inspect
+from functools import partial
 
 from medcat.cdb import CDB
 from medcat.utils.meta_cat.ml_utils import set_all_seeds
@@ -18,7 +21,7 @@ from medcat.datasets.data_collator import CollateAndPadNER
 
 from transformers import Trainer, AutoModelForTokenClassification, AutoTokenizer
 from transformers import pipeline, TrainingArguments
-import datasets
+from transformers.trainer_callback import TrainerCallback
 
 # It should be safe to do this always, as all other multiprocessing
 #will be finished before data comes to meta_cat
@@ -75,17 +78,33 @@ class TransformersNER(object):
         else:
             self.training_arguments = training_arguments
 
-
     def create_eval_pipeline(self):
-        self.ner_pipe = pipeline(model=self.model, task="ner", tokenizer=self.tokenizer.hf_tokenizer)
-        self.ner_pipe.device = self.model.device
 
-    def get_hash(self):
-        """A partial hash trying to catch differences between models."""
+        if self.config.general['chunking_overlap_window'] is None:
+            logger.warning("Chunking overlap window attribute in the config is set to None, hence chunking is disabled. Be cautious, PII data MAY BE REVEALED. To enable chunking, set the value to 0 or above.")
+        self.ner_pipe = pipeline(model=self.model, task="ner", tokenizer=self.tokenizer.hf_tokenizer,stride=self.config.general['chunking_overlap_window'])
+        if not hasattr(self.ner_pipe.tokenizer, '_in_target_context_manager'):
+            # NOTE: this will fix the DeID model(s) created before medcat 1.9.3
+            #       though this fix may very well be unstable
+            self.ner_pipe.tokenizer._in_target_context_manager = False
+        if not hasattr(self.ner_pipe.tokenizer, 'split_special_tokens'):
+            # NOTE: this will fix the DeID model(s) created with transformers before 4.42
+            #       and allow them to run with later transforemrs
+            self.ner_pipe.tokenizer.split_special_tokens = False
+        self.ner_pipe.device = self.model.device
+        self._consecutive_identical_failures = 0
+        self._last_exception: Optional[Tuple[str, Type[Exception]]] = None
+
+    def get_hash(self) -> str:
+        """A partial hash trying to catch differences between models.
+
+        Returns:
+            str: The hex hash.
+        """
         hasher = Hasher()
         # Set last_train_on if None
-        if self.config.general['last_train_on'] is None:
-            self.config.general['last_train_on'] = datetime.now().timestamp()
+        if self.config.general.last_train_on is None:
+            self.config.general.last_train_on = datetime.now().timestamp()
 
         hasher.update(self.config.get_hash())
         return hasher.hexdigest()
@@ -137,18 +156,29 @@ class TransformersNER(object):
 
         return out_path
 
-    def train(self, json_path: Union[str, list, None]=None, ignore_extra_labels=False, dataset=None, meta_requirements=None):
+    def train(self,
+              json_path: Union[str, list, None]=None,
+              ignore_extra_labels=False,
+              dataset=None,
+              meta_requirements=None,
+              trainer_callbacks: Optional[List[TrainerCallback]]=None) -> Tuple:
         """Train or continue training a model give a json_path containing a MedCATtrainer export. It will
         continue training if an existing model is loaded or start new training if the model is blank/new.
 
         Args:
             json_path (str or list):
                 Path/Paths to a MedCATtrainer export containing the meta_annotations we want to train for.
-            train_arguments(str):
-                HF TrainingArguments. If None the default will be used. Defaults to `None`.
             ignore_extra_labels:
                 Makes only sense when an existing deid model was loaded and from the new data we want to ignore
                 labels that did not exist in the old model.
+            dataset: Defaults to None.
+            meta_requirements: Defaults to None
+            trainer_callbacks (List[TrainerCallback]):
+                A list of trainer callbacks for collecting metrics during the training at the client side. The
+                transformers Trainer object will be passed in when each callback is called.
+
+        Returns:
+            Tuple: The dataframe, examples, and the dataset
         """
 
         if dataset is None and json_path is not None:
@@ -156,12 +186,23 @@ class TransformersNER(object):
             json_path = self._prepare_dataset(json_path, ignore_extra_labels=ignore_extra_labels,
                                               meta_requirements=meta_requirements, file_name='data_eval.json')
             # Load dataset
-            dataset = datasets.load_dataset(os.path.abspath(transformers_ner.__file__),
-                                            data_files={'train': json_path}, # type: ignore
-                                            split='train',
-                                            cache_dir='/tmp/')
+
+            # NOTE: The following is for backwards comppatibility
+            #       in datasets==2.20.0 `trust_remote_code=True` must be explicitly
+            #       specified, otherwise an error is raised.
+            #       On the other hand, the keyword argument was added in datasets==2.16.0
+            #       yet we support datasets>=2.2.0.
+            #       So we need to use the kwarg if applicable and omit its use otherwise.
+            if func_has_kwarg(datasets.load_dataset, 'trust_remote_code'):
+                ds_load_dataset = partial(datasets.load_dataset, trust_remote_code=True)
+            else:
+                ds_load_dataset = datasets.load_dataset
+            dataset = ds_load_dataset(os.path.abspath(transformers_ner.__file__),
+                                      data_files={'train': json_path}, # type: ignore
+                                      split='train',
+                                      cache_dir='/tmp/')
             # We split before encoding so the split is document level, as encoding
-            #does the document spliting into max_seq_len
+            #does the document splitting into max_seq_len
             dataset = dataset.train_test_split(test_size=self.config.general['test_size']) # type: ignore
 
         # Update labelmap in case the current dataset has more labels than what we had before
@@ -179,6 +220,7 @@ class TransformersNER(object):
 
 
         # Encode dataset
+        # Note: tokenizer.encode performs chunking
         encoded_dataset = dataset.map(
                 lambda examples: self.tokenizer.encode(examples, ignore_subwords=False),
                 batched=True,
@@ -193,11 +235,14 @@ class TransformersNER(object):
                 compute_metrics=lambda p: metrics(p, tokenizer=self.tokenizer, dataset=encoded_dataset['test'], verbose=self.config.general['verbose_metrics']),
                 data_collator=data_collator, # type: ignore
                 tokenizer=None)
+        if trainer_callbacks:
+            for callback in trainer_callbacks:
+                trainer.add_callback(callback(trainer))
 
         trainer.train() # type: ignore
 
         # Save the training time
-        self.config.general['last_train_on'] = datetime.now().timestamp() # type: ignore
+        self.config.general.last_train_on = datetime.now().timestamp() # type: ignore
 
         # Save everything
         self.save(save_dir_path=os.path.join(self.training_arguments.output_dir, 'final_model'))
@@ -223,6 +268,7 @@ class TransformersNER(object):
                                             cache_dir='/tmp/')
 
         # Encode dataset
+        # Note: tokenizer.encode performs chunking
         encoded_dataset = dataset.map(
                 lambda examples: self.tokenizer.encode(examples, ignore_subwords=False),
                 batched=True,
@@ -290,7 +336,7 @@ class TransformersNER(object):
         config = cast(ConfigTransformersNER, ConfigTransformersNER.load(os.path.join(save_dir_path, 'cat_config.json')))
         config.general['model_name'] = save_dir_path
 
-        # Overwrite loaded paramters with something new
+        # Overwrite loaded parameters with something new
         if config_dict is not None:
             config.merge_config(config_dict)
 
@@ -325,10 +371,19 @@ class TransformersNER(object):
         Args:
             stream (Iterable[spacy.tokens.Doc]):
                 List of spacy documents.
+            *args: Extra arguments (not used here).
+            **kwargs: Extra keyword arguments (not used here).
+
+        Yields:
+            Doc: The same document.
+
+        Returns:
+            Iterator[Doc]: If the stream is None or empty.
         """
         # Just in case
         if stream is None or not stream:
-            return stream
+            # return an empty generator
+            return
 
         batch_size_chars = self.config.general['pipe_batch_size_in_chars']
         yield from self._process(stream, batch_size_chars)  # type: ignore
@@ -341,34 +396,33 @@ class TransformersNER(object):
             #all_text_processed = self.tokenizer.encode_eval(all_text)
             # For now we will process the documents one by one, should be improved in the future to use batching
             for doc in docs:
-                try:
-                    res = self.ner_pipe(doc.text, aggregation_strategy=self.config.general['ner_aggregation_strategy'])
-                    doc.ents = []  # type: ignore
-                    for r in res:
-                        inds = []
-                        for ind, word in enumerate(doc):
-                            end_char = word.idx + len(word.text)
-                            if end_char <= r['end'] and end_char > r['start']:
-                                inds.append(ind)
-                            # To not loop through everything
-                            if end_char > r['end']:
-                                break
-                        if inds:
-                            entity = Span(doc, min(inds), max(inds) + 1, label=r['entity_group'])
-                            entity._.cui = r['entity_group']
-                            entity._.context_similarity = r['score']
-                            entity._.detected_name = r['word']
-                            entity._.id = len(doc._.ents)
-                            entity._.confidence = r['score']
+                res = self.ner_pipe(doc.text, aggregation_strategy=self.config.general['ner_aggregation_strategy'])
+                doc.ents = []  # type: ignore
+                for r in res:
+                    inds = []
+                    for ind, word in enumerate(doc):
+                        end_char = word.idx + len(word.text)
+                        if end_char <= r['end'] and end_char > r['start']:
+                            inds.append(ind)
+                        # To not loop through everything
+                        if end_char > r['end']:
+                            break
+                    if inds:
+                        entity = Span(doc, min(inds), max(inds) + 1, label=r['entity_group'])
+                        entity._.cui = r['entity_group']
+                        entity._.context_similarity = r['score']
+                        entity._.detected_name = r['word']
+                        entity._.id = len(doc._.ents)
+                        entity._.confidence = r['score']
 
-                            doc._.ents.append(entity)
-                    create_main_ann(self.cdb, doc)
-                    if self.cdb.config.general['make_pretty_labels'] is not None:
-                        make_pretty_labels(self.cdb, doc, LabelStyle[self.cdb.config.general['make_pretty_labels']])
-                    if self.cdb.config.general['map_cui_to_group'] is not None and self.cdb.addl_info.get('cui2group', {}):
-                        map_ents_to_groups(self.cdb, doc)
-                except Exception as e:
-                    logger.warning(e, exc_info=True)
+                        doc._.ents.append(entity)
+                create_main_ann(self.cdb, doc)
+                if self.cdb.config.general['make_pretty_labels'] is not None:
+                    make_pretty_labels(self.cdb, doc, LabelStyle[self.cdb.config.general['make_pretty_labels']])
+                if self.cdb.config.general['map_cui_to_group'] is not None and self.cdb.addl_info.get('cui2group', {}):
+                    map_ents_to_groups(self.cdb, doc)
+                self._consecutive_identical_failures = 0  # success
+                self._last_exception = None
             yield from docs
 
     # Override
@@ -377,11 +431,20 @@ class TransformersNER(object):
         document processing.
 
         Args:
-            doc (spacy.tokens.Doc):
+            doc (Doc):
                 A spacy document
+
+        Returns:
+            Doc: The same spacy document.
         """
 
         # Just call the pipe method
         doc = next(self.pipe(iter([doc])))
 
         return doc
+
+
+# NOTE: Only needed for datasets backwards compatibility
+def func_has_kwarg(func: Callable, keyword: str):
+    sig = inspect.signature(func)
+    return keyword in sig.parameters
